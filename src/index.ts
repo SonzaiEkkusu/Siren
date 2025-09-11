@@ -1,65 +1,79 @@
-// Cloudflare Workers (Modules) + nodejs_compat
-import { connect as tlsConnect, TLSSocket } from "node:tls";
+// Cloudflare Workers - SNI probe via cloudflare:sockets
+// No nodejs_compat, no node:tls
 
 const SNI_HOST = "myip.ipeek.workers.dev";
-const REQ_BODY =
-  `GET / HTTP/1.1\r\n` +
-  `Host: ${SNI_HOST}\r\n` +
-  `User-Agent: ProxyScanner/1.0\r\n` +
-  `Connection: close\r\n\r\n`;
 
 function parseTarget(pathname: string): { ip: string; port: number } {
-  // expects /149.129.250.8:443
-  const target = pathname.replace(/^\/+/, "");
+  const target = pathname.replace(/^\/+/, ""); // "149.129.250.8:443"
   if (!/^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(target)) {
     throw new Error("bad target format; use /IP:PORT");
   }
   const [ip, portStr] = target.split(":");
   const port = parseInt(portStr, 10);
-  // very light IPv4 octet validation:
-  const ok = ip.split(".").every((x) => Number(x) >= 0 && Number(x) <= 255);
-  if (!ok || port < 1 || port > 65535) throw new Error("invalid IP or port");
+  const okIP = ip.split(".").every((x) => {
+    const n = Number(x);
+    return Number.isInteger(n) && n >= 0 && n <= 255;
+  });
+  if (!okIP || port < 1 || port > 65535) throw new Error("invalid IP or port");
   return { ip, port };
 }
 
 async function probe(ip: string, port: number, timeoutMs = 5000) {
-  return await new Promise<{ statusLine: string; headers: Record<string, string>; body: string }>((resolve, reject) => {
-    const sock: TLSSocket = tlsConnect(
-      {
-        host: ip,       // connect to this IP
-        port,           // and this port
-        servername: SNI_HOST, // <-- set SNI to myip.ipeek.workers.dev
-        rejectUnauthorized: false, // like curl -k
-        ALPNProtocols: ["http/1.1"], // force H1 (scanner kamu pakai HTTP/1.1)
-      },
-      () => {
-        sock.write(REQ_BODY);
-      }
-    );
+  // 1) buka TCP dulu
+  // @ts-ignore - cloudflare runtime
+  const tcpSocket = (await import("cloudflare:sockets")).connect({ hostname: ip, port });
 
-    let raw = "";
-    const t = setTimeout(() => {
-      sock.destroy();
-      reject(new Error("socket timeout"));
-    }, timeoutMs);
-
-    sock.on("data", (d) => (raw += d.toString()));
-    sock.on("error", (e) => {
-      clearTimeout(t);
-      reject(e);
-    });
-    sock.on("end", () => {
-      clearTimeout(t);
-      const [head = "", body = ""] = raw.split("\r\n\r\n");
-      const [statusLine = "", ...headerLines] = head.split("\r\n");
-      const headers: Record<string, string> = {};
-      for (const line of headerLines) {
-        const i = line.indexOf(":");
-        if (i > -1) headers[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim();
-      }
-      resolve({ statusLine, headers, body });
-    });
+  // 2) upgrade ke TLS dengan SNI = myip.ipeek.workers.dev, paksa HTTP/1.1
+  const tlsSocket = await tcpSocket.startTls({
+    servername: SNI_HOST,
+    alpnProtocols: ["http/1.1"],
   });
+
+  // 3) kirim HTTP/1.1 GET / dengan Host header = SNI
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const request =
+    `GET / HTTP/1.1\r\n` +
+    `Host: ${SNI_HOST}\r\n` +
+    `User-Agent: SNI-Probe/1.0\r\n` +
+    `Connection: close\r\n\r\n`;
+
+  const writer = tlsSocket.writable.getWriter();
+  await writer.write(encoder.encode(request));
+  await writer.close(); // biar remote segera kirim respon dan tutup
+
+  // 4) baca semua data sampai socket close / timeout
+  const reader = tlsSocket.readable.getReader();
+  let raw = "";
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { reader.releaseLock(); } catch {}
+    try { tlsSocket.close(); } catch {}
+  }, timeoutMs);
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) raw += decoder.decode(value, { stream: true });
+      if (timedOut) throw new Error("socket timeout");
+    }
+  } finally {
+    clearTimeout(timer);
+    try { reader.releaseLock(); } catch {}
+    try { tlsSocket.close(); } catch {}
+  }
+
+  // 5) pisahkan header & body
+  const [head = "", body = ""] = raw.split("\r\n\r\n");
+  const [statusLine = "", ...headerLines] = head.split("\r\n");
+  const headers: Record<string, string> = {};
+  for (const line of headerLines) {
+    const i = line.indexOf(":");
+    if (i > -1) headers[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim();
+  }
+  return { statusLine, headers, body };
 }
 
 export default {
@@ -73,20 +87,21 @@ export default {
       const { ip, port } = parseTarget(url.pathname);
       const raw = await probe(ip, port);
 
-      // coba parse body sebagai JSON (kalau sukses, balikin ringkas)
+      // Coba parse body sebagai JSON (target sukses = balas JSON myip worker)
       try {
         const json = JSON.parse(raw.body);
-        const out = {
-          ok: true,
-          target: `${ip}:${port}`,
-          result: json,
-        };
-        return Response.json(out, { status: 200 });
+        return Response.json({ ok: true, target: `${ip}:${port}`, result: json });
       } catch {
-        // kalau bukan JSON dari worker tujuan, balikin raw biar kelihatan
+        // bukan JSON → kirim raw untuk diagnosa
         return new Response(
           JSON.stringify(
-            { ok: false, target: `${ip}:${port}`, statusLine: raw.statusLine, headers: raw.headers, body: raw.body.slice(0, 2000) },
+            {
+              ok: false,
+              target: `${ip}:${port}`,
+              statusLine: raw.statusLine,
+              headers: raw.headers,
+              body: raw.body.slice(0, 2000),
+            },
             null,
             2
           ),

@@ -1,7 +1,3 @@
 name = "sni-probe"
 main = "src/index.ts"
 compatibility_date = "2025-08-01"
-compatibility_flags = ["nodejs_compat"]
-
-# optional: custom domain/route
-# routes = [{ pattern = "my-workers.dev/*", zone_id = "<your-zone-id>" }]
